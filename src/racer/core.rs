@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Read;
 use std::{vec, fmt};
 use std::{str, path};
@@ -10,6 +10,7 @@ use std::slice;
 use std::cmp::{min, max};
 use std::iter::{Fuse, Iterator};
 use std::rc::Rc;
+use std::time::SystemTime;
 use codeiter::StmtIndicesIter;
 use matchers::PendingImports;
 
@@ -334,7 +335,8 @@ impl fmt::Debug for PathSearch {
 pub struct IndexedSource {
     pub code: String,
     pub idx: Vec<(usize, usize)>,
-    pub lines: RefCell<Vec<(usize, usize)>>
+    pub lines: RefCell<Vec<(usize, usize)>>,
+    pub mtime: Option<SystemTime>
 }
 
 #[derive(Clone,Copy)]
@@ -350,15 +352,23 @@ impl IndexedSource {
         IndexedSource {
             code: src,
             idx: indices,
-            lines: RefCell::new(Vec::new())
+            lines: RefCell::new(Vec::new()),
+            mtime: None
         }
+    }
+
+    pub fn new_with_mtime(src: String, mtime: SystemTime) -> IndexedSource {
+        let mut source = IndexedSource::new(src);
+        source.mtime = Some(mtime);
+        source
     }
 
     pub fn with_src(&self, new_src: String) -> IndexedSource {
         IndexedSource {
             code: new_src,
             idx: self.idx.clone(),
-            lines: self.lines.clone()
+            lines: self.lines.clone(),
+            mtime: None
         }
     }
 
@@ -656,24 +666,41 @@ impl FileCache {
 
 
     fn load_file(&self, filepath: &path::Path) -> Rc<IndexedSource> {
+        let stat = fs::metadata(filepath).expect("get file stats");
+        let mtime = stat.modified().expect("get mtime of file");
+        self.load_file_with_mtime(filepath, mtime)
+    }
+
+    fn load_file_with_mtime(&self, filepath: &path::Path, mtime: SystemTime) -> Rc<IndexedSource> {
         if let Some(src) = self.raw_map.borrow().get(filepath) {
-            return src.clone();
+            if let Some(src_mtime) = src.mtime {
+                if src_mtime >= mtime {
+                    return src.clone();
+                }
+            }
         }
 
         // nothing found, insert into cache
         // Ugh, really need handle results on all these methods :(
         let res = self.loader.load_file(filepath).expect("load file successfully");
-        let src = Rc::new(IndexedSource::new(res));
+        let src = Rc::new(IndexedSource::new_with_mtime(res, mtime));
         self.raw_map.borrow_mut().insert(filepath.to_path_buf(), src.clone());
         src
     }
 
     fn load_file_and_mask_comments(&self, filepath: &path::Path) -> Rc<IndexedSource> {
-        if let Some(src) = self.masked_map.borrow().get(filepath) {
-            return src.clone();
+        let stat = fs::metadata(filepath).expect("get file stats");
+        let mtime = stat.modified().expect("get mtime of file");
+
+        if let Some(src) = self.raw_map.borrow().get(filepath) {
+            if let Some(src_mtime) = src.mtime {
+                if src_mtime >= mtime {
+                    return src.clone();
+                }
+            }
         }
         // nothing found, insert into cache
-        let src = self.load_file(filepath);
+        let src = self.load_file_with_mtime(filepath, mtime);
         let msrc = Rc::new(src.with_src(scopes::mask_comments(src.as_src())));
         self.masked_map.borrow_mut().insert(filepath.to_path_buf(),
                                             msrc.clone());
